@@ -36,6 +36,8 @@ import json
 import time
 import types
 import generation_functions
+from v2.Fast_dLLM_v2_7B.modeling import Fast_dLLM_QwenForCausalLM
+
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -57,7 +59,7 @@ class Fast_dLLM_v2EvalHarness(LM):
         batch_size=32,
         mask_id=151665,
         use_block_cache=False,
-        small_block_size=8,
+        small_block_size=32,
         bd_size=32,
         threshold=0.9,
         **kwargs,
@@ -75,7 +77,7 @@ class Fast_dLLM_v2EvalHarness(LM):
         if self.accelerator is not None:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
         
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = Fast_dLLM_QwenForCausalLM.from_pretrained(
             model_path, 
             trust_remote_code=True, 
             torch_dtype=torch.bfloat16, 

@@ -5,7 +5,7 @@ dataset_path=data/alpaca/train_conversation
 output_dir=output_models/finetune_fast_dLLM_7B-test
 deepspeed_args="--master_port=11000"
 conversation_template=fast_dllm_v2
-export CUDA_HOME=/lustre/fsw/portfolios/nvr/users/chengyuew/anaconda3/envs/lmflow
+export CUDA_HOME=/home/zwang53/miniconda3/envs/Fast-dLLM
 
 trust_remote_code=1
 
@@ -55,7 +55,7 @@ cmd="deepspeed ${deepspeed_args} \
     --dataloader_num_workers 8 \
     --preprocessing_num_workers 32 \
     --save_total_limit 10 \
-    --gradient_checkpointing 1 
+    --gradient_checkpointing 1 "
 
 echo $cmd
 eval $cmd
