@@ -62,6 +62,7 @@ class Fast_dLLM_v2EvalHarness(LM):
         small_block_size=32,
         bd_size=32,
         threshold=0.9,
+        speed_log_path=None,
         **kwargs,
     ):
 
@@ -109,6 +110,7 @@ class Fast_dLLM_v2EvalHarness(LM):
         self.small_block_size = small_block_size
         self.threshold = threshold
         self.bd_size = bd_size
+        self.speed_log_path = speed_log_path
 
     @property
     def rank(self):
@@ -302,6 +304,26 @@ class Fast_dLLM_v2EvalHarness(LM):
             print(f"Total number of tokens generated: {num_tokens}")
             print(f"Total time taken: {end_time - start_time} seconds")
             print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
+            if self.speed_log_path is not None:
+                # save speed, self.small_block_size, bd_size, into this json file
+                import json
+                from datetime import datetime
+
+                timestamp = datetime.now().isoformat().replace(':', '-')
+                log_data = {
+                    "timestamp": timestamp,
+                    "num_tokens": num_tokens.item(),
+                    "time_taken_second": end_time - start_time,
+                    "tokens_per_second": (num_tokens / (end_time - start_time)).item(),
+                    "small_block_size": self.small_block_size,
+                    "bd_size": self.bd_size
+                }
+
+                with open(self.speed_log_path +"_"+ timestamp + '.json', 'w') as f:
+                    json.dump(log_data, f, indent=2)
+
+                print(f"Speed log saved to: {self.speed_log_path}")
+
             
         return output
 
