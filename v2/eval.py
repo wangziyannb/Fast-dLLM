@@ -18,6 +18,10 @@
 '''
 This file is inspired by the code from https://github.com/ML-GSAI/SMDM
 '''
+import hashlib
+import math
+from typing import OrderedDict, Tuple, List, Optional, Sequence, Dict
+
 import accelerate
 import torch
 import re
@@ -51,19 +55,24 @@ def set_seed(seed):
 @register_model("fast_dllm_v2")
 class Fast_dLLM_v2EvalHarness(LM):
     def __init__(
-        self,
-        model_path='Efficient-Large-Model/Fast_dLLM_v2_7B',
-        device="cuda",
-        show_speed=False,
-        max_new_tokens=2048,
-        batch_size=32,
-        mask_id=151665,
-        use_block_cache=False,
-        small_block_size=32,
-        bd_size=32,
-        threshold=0.9,
-        speed_log_path=None,
-        **kwargs,
+            self,
+            model_path='Efficient-Large-Model/Fast_dLLM_v2_7B',
+            device="cuda",
+            show_speed=False,
+            max_new_tokens=2048,
+            batch_size=32,
+            mask_id=151665,
+            use_block_cache=False,
+            small_block_size=32,
+            bd_size=32,
+            threshold=0.9,
+            speed_log_path=None,
+            # ===== DP planning for prefix (loglikelihood) =====
+            dp_block_sizes=(1, 2, 4, 8, 16, 32),
+            dp_max_analyze_len=None,  # 可选：只对 prefix 末尾 N tokens 做 DP（默认 None=全量）
+            dp_cache_size=4096,  # prefix plan LRU cache
+            dp_fixed_block_size=None,  # 若 dp_max_analyze_len 截断，前面那段用固定块大小（默认用 self.bd_size）
+            **kwargs,
     ):
 
         super().__init__()
@@ -73,20 +82,21 @@ class Fast_dLLM_v2EvalHarness(LM):
             self.accelerator = accelerator
         else:
             self.accelerator = None
-        
+
         model_kwargs = {}
         if self.accelerator is not None:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
-        
+
         self.model = Fast_dLLM_QwenForCausalLM.from_pretrained(
-            model_path, 
-            trust_remote_code=True, 
-            torch_dtype=torch.bfloat16, 
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
             **model_kwargs
         )
         self.model.eval()
 
-        self.model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample, self.model)
+        self.model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample,
+                                                 self.model)
 
         self.device = torch.device(device)
         if self.accelerator is not None:
@@ -94,13 +104,13 @@ class Fast_dLLM_v2EvalHarness(LM):
             self.device = torch.device(f'{self.accelerator.device}')
             self._rank = self.accelerator.local_process_index
             self._world_size = self.accelerator.num_processes
-        else: 
+        else:
             self.model = self.model.to(device)
             self._rank = 0
             self._world_size = 1
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        
+
         self.show_speed = show_speed
         self.max_new_tokens = max_new_tokens
         self.batch_size = int(batch_size)
@@ -111,11 +121,18 @@ class Fast_dLLM_v2EvalHarness(LM):
         self.threshold = threshold
         self.bd_size = bd_size
         self.speed_log_path = speed_log_path
+        # LRU cache: key -> plan_prefix (List[int])
+        self._prefix_plan_cache: "OrderedDict[Tuple, List[int]]" = OrderedDict()
+        self.dp_max_analyze_len = dp_max_analyze_len
+        self.dp_cache_size = dp_cache_size
+        self.dp_fixed_block_size = dp_fixed_block_size
+        self.dp_block_sizes = dp_block_sizes
+
 
     @property
     def rank(self):
         return self._rank
-    
+
     @property
     def world_size(self):
         return self._world_size
@@ -123,13 +140,14 @@ class Fast_dLLM_v2EvalHarness(LM):
     @property
     def tokenizer_name(self):
         return self.model_path
-    
+
     def apply_chat_template(self, chat_history, add_generation_prompt=True):
-        return self.tokenizer.apply_chat_template(chat_history, add_generation_prompt=add_generation_prompt, tokenize=False)
-    
+        return self.tokenizer.apply_chat_template(chat_history, add_generation_prompt=add_generation_prompt,
+                                                  tokenize=False)
+
     def loglikelihood_rolling(self, requests):
         raise NotImplementedError
-    
+
     def _encode_pair(self, context, continuation):
         whole_enc = self.tokenizer(context + continuation)["input_ids"]
         context_enc = self.tokenizer(context)["input_ids"]
@@ -139,44 +157,101 @@ class Fast_dLLM_v2EvalHarness(LM):
 
         return context_enc, continuation_enc
 
-
     def _forward_process(self, batch, prompt_index):
         b, l = batch.shape
 
         batch[:, prompt_index.sum()] = self.mask_id
 
-        batch = torch.cat([batch.to(self.device), torch.full((b, self.bd_size-batch.shape[1]%self.bd_size), self.mask_id, dtype=torch.long, device=self.device)], dim=1)
+        batch = torch.cat([batch.to(self.device),
+                           torch.full((b, self.bd_size - batch.shape[1] % self.bd_size), self.mask_id, dtype=torch.long,
+                                      device=self.device)], dim=1)
         if batch.shape[1] > l:
             batch[:, l] = self.tokenizer.eos_token_id
 
         return batch
 
+    # @torch.no_grad()
+    # def get_logits(self, batch):
+    #     logits = self.model(batch, block_size=self.bd_size).logits
+    #     logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+    #     return logits[:, :batch.shape[1]]
+
     @torch.no_grad()
-    def get_logits(self, batch):
-        logits = self.model(batch).logits
+    def get_logits(self, batch, block_sizes: Optional[torch.Tensor] = None):
+        if block_sizes is None:
+            logits = self.model(batch, use_cache=False).logits
+        else:
+            logits = self.model(batch, use_cache=False, block_sizes=block_sizes).logits
+
+        # align: logits_shift[:, t] predicts token t
         logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
         return logits[:, :batch.shape[1]]
 
+    # @torch.no_grad()
+    # def get_loglikelihood(self, prefix, target):
+    #     seq = torch.concatenate([prefix, target])[None, :]
+    #
+    #     prompt_index = torch.arange(seq.shape[1], device=self.device) < len(prefix)
+    #
+    #     loss_acc = []
+    #
+    #     perturbed_seq = self._forward_process(seq.clone(), prompt_index)
+    #
+    #     mask_indices = perturbed_seq == self.mask_id
+    #
+    #     logits = self.get_logits(perturbed_seq)
+    #     seq = torch.cat([seq.to(self.device), torch.full((seq.shape[0], self.bd_size-seq.shape[1]%self.bd_size), -100, dtype=torch.long, device=self.device)], dim=1)
+    #     loss = F.cross_entropy(logits[mask_indices], seq[mask_indices], reduction='none')
+    #     loss = loss.sum()
+    #     loss_acc.append(loss.item())
+    #
+    #     return - sum(loss_acc) / len(loss_acc)
+
     @torch.no_grad()
-    def get_loglikelihood(self, prefix, target):
+    def get_loglikelihood(self, prefix, target, prefix_text: Optional[str] = None):
+        # seq: (1, L0)
         seq = torch.concatenate([prefix, target])[None, :]
 
-        prompt_index = torch.arange(seq.shape[1], device=self.device) < len(prefix)
+        prefix_len = int(prefix.numel())
+
+        # keep prompt_index on CPU (safer for indexing)
+        prompt_index = (torch.arange(seq.shape[1]) < prefix_len)
 
         loss_acc = []
 
-        perturbed_seq = self._forward_process(seq.clone(), prompt_index)
+        perturbed_seq = self._forward_process(seq.clone(), prompt_index)  # (1, L1) on device
+        total_len = int(perturbed_seq.shape[1])
 
+        # ---- 1) DP analyze prefix -> plan_prefix ----
+        plan_prefix = self._get_or_compute_prefix_plan(prefix, prefix_text=prefix_text)
+
+        # ---- 2) build total plan for full forward (prefix plan + fixed tail) ----
+        plan_total = self._build_total_block_plan(
+            plan_prefix=plan_prefix,
+            prefix_len=prefix_len,
+            total_len=total_len,
+        )
+        block_sizes_tensor = torch.tensor(plan_total, device=self.device, dtype=torch.long)
+
+        # ---- 3) forward with variable block_sizes ----
         mask_indices = perturbed_seq == self.mask_id
+        logits = self.get_logits(perturbed_seq, block_sizes=block_sizes_tensor)
 
-        logits = self.get_logits(perturbed_seq)
-        seq = torch.cat([seq.to(self.device), torch.full((seq.shape[0], self.bd_size-seq.shape[1]%self.bd_size), -100, dtype=torch.long, device=self.device)], dim=1)
-        loss = F.cross_entropy(logits[mask_indices], seq[mask_indices], reduction='none')
+        # pad labels to same length as perturbed_seq (keep your original behavior)
+        pad_len = self.bd_size - seq.shape[1] % self.bd_size
+        seq_padded = torch.cat(
+            [
+                seq.to(self.device),
+                torch.full((seq.shape[0], pad_len), -100, dtype=torch.long, device=self.device),
+            ],
+            dim=1,
+        )
+
+        loss = F.cross_entropy(logits[mask_indices], seq_padded[mask_indices], reduction='none')
         loss = loss.sum()
         loss_acc.append(loss.item())
 
         return - sum(loss_acc) / len(loss_acc)
-
 
     def loglikelihood(self, requests):
         def _tokenize(e):
@@ -203,20 +278,21 @@ class Fast_dLLM_v2EvalHarness(LM):
                 prefix = elem["prefix"]
                 target = elem["target"]
 
-                ll = self.get_loglikelihood(prefix, target)
+                # ll = self.get_loglikelihood(prefix, target)
+                ll = self.get_loglikelihood(prefix, target, prefix_text=elem["prefix_text"])
                 out.append((ll, 0.0))
         torch.cuda.empty_cache()
         return out
-    
+
     def generate_until(self, requests):
         output = [None] * len(requests)  # pre-allocate output list
         num_tokens = 0
-        
+
         start_time = time.time()
-        
+
         requests_with_indices = [(i, req) for i, req in enumerate(requests)]
         requests_with_indices.sort(key=lambda x: len(x[1].args[0]))
-        
+
         batched_requests = []
         current_batch = []
         for i, req in requests_with_indices:
@@ -224,7 +300,7 @@ class Fast_dLLM_v2EvalHarness(LM):
             if len(current_batch) == self.batch_size:
                 batched_requests.append(current_batch)
                 current_batch = []
-        
+
         if current_batch:
             batched_requests.append(current_batch)
 
@@ -233,25 +309,29 @@ class Fast_dLLM_v2EvalHarness(LM):
             max_len = 0
             min_len = 1e9
             seq_len = []
-            
+
             for orig_idx, req in batch:
                 question = req.args[0]
-                
+
                 if req.task_name.startswith('minerva_math'):
-                    question = question.replace("Solution:", "Please reason step by step, and put your final answer within \\boxed{{}}.")
+                    question = question.replace("Solution:",
+                                                "Please reason step by step, and put your final answer within \\boxed{{}}.")
                 elif req.task_name.startswith('gsm8k'):
-                    question = question.replace("Answer:", "Please reason step by step, and put your final answer within \\boxed{{}}.")
+                    question = question.replace("Answer:",
+                                                "Please reason step by step, and put your final answer within \\boxed{{}}.")
                 model_inputs = self.tokenizer([question], return_tensors="pt").to(self.device)
                 batched_input_ids.append(model_inputs["input_ids"])
                 max_len = max(max_len, model_inputs["input_ids"].shape[1])
                 min_len = min(min_len, model_inputs["input_ids"].shape[1])
                 seq_len.append(model_inputs["input_ids"].shape[1])
-            
+
             # pad batched_input_ids to the same length
-            batched_input_ids = [torch.cat([input_ids, torch.full((1, max_len - input_ids.shape[1]), self.mask_id, dtype=torch.long, device=self.device)], dim=1) for input_ids in batched_input_ids]
+            batched_input_ids = [torch.cat([input_ids, torch.full((1, max_len - input_ids.shape[1]), self.mask_id,
+                                                                  dtype=torch.long, device=self.device)], dim=1) for
+                                 input_ids in batched_input_ids]
             batched_input_ids = torch.cat(batched_input_ids, dim=0)
             batched_input_ids = batched_input_ids.to(self.device)
-            
+
             with torch.no_grad():
                 if self.accelerator is not None:
                     generated_ids = self.accelerator.unwrap_model(self.model).mdm_sample(
@@ -279,18 +359,18 @@ class Fast_dLLM_v2EvalHarness(LM):
                         use_block_cache=self.use_block_cache,
                         threshold=self.threshold,
                     )
-            
+
             # extract new generated tokens, and keep original index order
             for batch_pos, (orig_idx, req) in enumerate(batch):
                 generated_answer = self.tokenizer.decode(
-                    generated_ids[batch_pos][seq_len[batch_pos]:], 
+                    generated_ids[batch_pos][seq_len[batch_pos]:],
                     skip_special_tokens=True
                 )
-            
+
                 # count token number
                 if self.show_speed:
                     num_tokens += (generated_ids[batch_pos][seq_len[batch_pos]:] != self.mask_id).sum()
-                
+
                 # put result in the correct original index position
                 output[orig_idx] = generated_answer
 
@@ -298,7 +378,7 @@ class Fast_dLLM_v2EvalHarness(LM):
                 print('question: ', req.args[0])
                 print('answer: ', generated_answer)
                 print('=' * 20, end='\n\n')
-            
+
         end_time = time.time()
         if self.show_speed:
             print(f"Total number of tokens generated: {num_tokens}")
@@ -319,15 +399,243 @@ class Fast_dLLM_v2EvalHarness(LM):
                     "bd_size": self.bd_size
                 }
 
-                with open(self.speed_log_path +"_"+ timestamp + '.json', 'w') as f:
+                with open(self.speed_log_path + "_" + timestamp + '.json', 'w') as f:
                     json.dump(log_data, f, indent=2)
 
                 print(f"Speed log saved to: {self.speed_log_path}")
 
-            
         return output
+
+    # -------------------------
+    # DP utilities (prefix plan)
+    # -------------------------
+    def _is_valid_cost(self, x) -> bool:
+        return x is not None and not (isinstance(x, float) and math.isnan(x))
+
+    def _make_prefix_cache_key(
+            self,
+            prefix_ids: torch.Tensor,
+            prefix_text: Optional[str] = None,
+    ) -> Tuple:
+        """
+        Prefer prefix_text as cache key (cheap & stable); fallback to sha1(ids).
+        """
+        if prefix_text is not None:
+            return ("text", prefix_text)
+
+        # fallback: hash ids bytes
+        ids = prefix_ids.detach().cpu().numpy()
+        h = hashlib.sha1(ids.tobytes()).hexdigest()
+        return ("ids", int(prefix_ids.numel()), h)
+
+    def _cache_get_prefix_plan(self, key: Tuple) -> Optional[List[int]]:
+        plan = self._prefix_plan_cache.get(key, None)
+        if plan is None:
+            return None
+        # refresh LRU
+        self._prefix_plan_cache.move_to_end(key)
+        return plan
+
+    def _cache_put_prefix_plan(self, key: Tuple, plan: List[int]) -> None:
+        self._prefix_plan_cache[key] = plan
+        self._prefix_plan_cache.move_to_end(key)
+        if len(self._prefix_plan_cache) > self.dp_cache_size:
+            self._prefix_plan_cache.popitem(last=False)
+
+    def _fixed_plan_for_len(self, length: int, block_size: int) -> List[int]:
+        if length <= 0:
+            return []
+        plan = []
+        remaining = length
+        while remaining > 0:
+            take = min(block_size, remaining)
+            plan.append(int(take))
+            remaining -= take
+        return plan
+
+    @torch.no_grad()
+    def _masked_block_avg_loss_prefix(
+            self,
+            prefix_ids_device: torch.Tensor,  # 1D on device
+            i: int,
+            B: int,
+    ) -> float:
+        """
+        Compute masked-block avg CE on prefix only:
+          x = prefix[:i+B], mask x[i:i+B]
+          forward with block_size=B (fixed) to get logits
+          shift logits and compute CE only on masked positions.
+        Returns avg loss over the B tokens.
+        """
+        # x: (1, i+B)
+        x = prefix_ids_device[: i + B].clone().unsqueeze(0)  # (1, L)
+        x[:, i:i + B] = self.mask_id
+
+        out = self.model(
+            x,
+            use_cache=False,
+            output_hidden_states=False,
+            block_size=B,  # NOTE: analysis step uses scalar B (same spirit as your earlier DP script)
+        )
+        logits = out.logits  # (1, L, V)
+
+        if logits.dim() != 3:
+            return float("nan")
+
+        # token-shift alignment: logits_shift[:, t] predicts token t
+        logits_shift = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+        V = logits_shift.size(-1)
+
+        sel_logits = logits_shift[:, i:i + B, :].reshape(-1, V).float()
+        sel_target = prefix_ids_device[i:i + B].reshape(-1)
+
+        ce = F.cross_entropy(sel_logits, sel_target, reduction="none")  # (B,)
+        return float(ce.mean().item())
+
+    @torch.no_grad()
+    def _compute_prefix_cost_table_avg(
+            self,
+            prefix_ids: torch.Tensor,  # 1D CPU ok
+            block_sizes: Sequence[int],
+    ) -> Dict[int, List[float]]:
+        """
+        results[B][i] = avg masked-block loss for block starting at i with size B (NaN if i+B>k)
+        """
+        k = int(prefix_ids.numel())
+        results: Dict[int, List[float]] = {int(B): [float("nan")] * k for B in block_sizes}
+        if k == 0:
+            return results
+
+        prefix_ids_device = prefix_ids.to(self.device)
+
+        for B in block_sizes:
+            B = int(B)
+            if B <= 0:
+                continue
+            if B > k:
+                continue
+            for i in range(0, k):
+                if i + B > k:
+                    # keep NaN
+                    continue
+                results[B][i] = self._masked_block_avg_loss_prefix(prefix_ids_device, i, B)
+
+        return results
+
+    def _dp_plan_min_sum_avg(
+            self,
+            results_avg: Dict[int, List[float]],
+            k: int,
+            block_sizes: Sequence[int],
+    ) -> List[int]:
+        """
+        DP objective: minimize sum over steps of avg_cost(i,B)
+        Exactly the same objective as your earlier dp_route_min_avg(stat="avg").
+        Returns: plan as list of block sizes whose sum == k (or shorter if infeasible).
+        """
+        dp = [float("inf")] * (k + 1)
+        nxt: List[Optional[int]] = [None] * (k + 1)
+        dp[k] = 0.0
+
+        for i in range(k - 1, -1, -1):
+            best = float("inf")
+            bestB = None
+            for B in block_sizes:
+                B = int(B)
+                if i + B <= k:
+                    c = results_avg[B][i]
+                    if not self._is_valid_cost(c):
+                        continue
+                    v = c + dp[i + B]
+                    if v < best:
+                        best = v
+                        bestB = B
+            dp[i] = best
+            nxt[i] = bestB
+
+        plan: List[int] = []
+        i = 0
+        while i < k and nxt[i] is not None:
+            B = int(nxt[i])
+            plan.append(B)
+            i += B
+
+        return plan
+
+    def _get_or_compute_prefix_plan(
+            self,
+            prefix_ids: torch.Tensor,  # 1D CPU tensor from dataset
+            prefix_text: Optional[str] = None,
+    ) -> List[int]:
+        """
+        Returns a block-size plan for the *entire prefix length*.
+        If dp_max_analyze_len is set and prefix is longer, only DP the suffix;
+        the earlier part uses fixed blocks (dp_fixed_block_size or self.bd_size).
+        """
+        key = self._make_prefix_cache_key(prefix_ids, prefix_text=prefix_text)
+        cached = self._cache_get_prefix_plan(key)
+        if cached is not None:
+            return cached
+
+        P = int(prefix_ids.numel())
+        if P == 0:
+            self._cache_put_prefix_plan(key, [])
+            return []
+
+        # Optional: analyze only suffix to control cost
+        fixed_plan: List[int] = []
+        ids_for_dp = prefix_ids
+        if self.dp_max_analyze_len is not None and P > int(self.dp_max_analyze_len):
+            analyze_len = int(self.dp_max_analyze_len)
+            fixed_len = P - analyze_len
+            fixed_bs = self.dp_fixed_block_size if self.dp_fixed_block_size is not None else int(self.bd_size)
+            fixed_plan = self._fixed_plan_for_len(fixed_len, fixed_bs)
+            ids_for_dp = prefix_ids[fixed_len:]  # suffix
+
+        k = int(ids_for_dp.numel())
+        results_avg = self._compute_prefix_cost_table_avg(ids_for_dp, self.dp_block_sizes)
+        suffix_plan = self._dp_plan_min_sum_avg(results_avg, k=k, block_sizes=self.dp_block_sizes)
+
+        plan = fixed_plan + suffix_plan
+
+        # Sanity: sum(plan) should equal total prefix length P (unless infeasible)
+        if sum(plan) != P:
+            # Fallback: if DP produced incomplete plan, pad remainder with fixed blocks
+            missing = P - sum(plan)
+            if missing > 0:
+                fixed_bs = self.dp_fixed_block_size if self.dp_fixed_block_size is not None else int(self.bd_size)
+                plan += self._fixed_plan_for_len(missing, fixed_bs)
+
+        self._cache_put_prefix_plan(key, plan)
+        return plan
+
+    def _build_total_block_plan(
+            self,
+            plan_prefix: List[int],
+            prefix_len: int,
+            total_len: int,
+    ) -> List[int]:
+        """
+        Build block_sizes plan for the whole perturbed sequence:
+          - prefix part: plan_prefix (sum == prefix_len)
+          - rest part (target + eos + pad): fill with fixed self.bd_size blocks
+        """
+        if prefix_len < 0 or total_len < 0 or prefix_len > total_len:
+            raise ValueError(f"Invalid lengths: prefix_len={prefix_len}, total_len={total_len}")
+
+        if sum(plan_prefix) != prefix_len:
+            # Be strict: we rely on this for correctness of block_sizes sum.
+            raise ValueError(f"plan_prefix sum {sum(plan_prefix)} != prefix_len {prefix_len}")
+
+        rest_len = total_len - prefix_len
+        plan_rest = self._fixed_plan_for_len(rest_len, int(self.bd_size))
+        plan_total = list(plan_prefix) + plan_rest
+
+        if sum(plan_total) != total_len:
+            raise ValueError(f"plan_total sum {sum(plan_total)} != total_len {total_len}")
+
+        return plan_total
 
 
 if __name__ == "__main__":
     cli_evaluate()
-    
