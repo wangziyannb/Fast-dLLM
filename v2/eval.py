@@ -72,6 +72,9 @@ class Fast_dLLM_v2EvalHarness(LM):
             dp_max_analyze_len=None,  # 可选：只对 prefix 末尾 N tokens 做 DP（默认 None=全量）
             dp_cache_size=4096,  # prefix plan LRU cache
             dp_fixed_block_size=None,  # 若 dp_max_analyze_len 截断，前面那段用固定块大小（默认用 self.bd_size）
+            debug_prefix_dp=False,
+            debug_prefix_dp_first_n=10,  # 只打印前 N 个样本，<=0 表示全打印
+            debug_prefix_dp_force_recompute=False,  # True: 即使cache命中也重新算一次(方便你一直看)
             **kwargs,
     ):
 
@@ -127,6 +130,10 @@ class Fast_dLLM_v2EvalHarness(LM):
         self.dp_cache_size = dp_cache_size
         self.dp_fixed_block_size = dp_fixed_block_size
         self.dp_block_sizes = dp_block_sizes
+        self.debug_prefix_dp = bool(debug_prefix_dp)
+        self.debug_prefix_dp_first_n = int(debug_prefix_dp_first_n)
+        self.debug_prefix_dp_force_recompute = bool(debug_prefix_dp_force_recompute)
+        self._debug_prefix_dp_cnt = 0
 
 
     @property
@@ -222,13 +229,28 @@ class Fast_dLLM_v2EvalHarness(LM):
         perturbed_seq = self._forward_process(seq.clone(), prompt_index)  # (1, L1) on device
         total_len = int(perturbed_seq.shape[1])
 
-        # ---- 1) DP analyze prefix -> plan_prefix ----
-        plan_prefix = self._get_or_compute_prefix_plan(prefix, prefix_text=prefix_text)
+        # # ---- 1) DP analyze prefix -> plan_prefix ----
+        # plan_prefix = self._get_or_compute_prefix_plan(prefix, prefix_text=prefix_text)
+        #
+        # # ---- 2) build total plan for full forward (prefix plan + fixed tail) ----
+        # plan_total = self._build_total_block_plan(
+        #     plan_prefix=plan_prefix,
+        #     prefix_len=prefix_len,
+        #     total_len=total_len,
+        # )
+        # block_sizes_tensor = torch.tensor(plan_total, device=self.device, dtype=torch.long)
 
-        # ---- 2) build total plan for full forward (prefix plan + fixed tail) ----
+        # ---- 1) DP analyze full seq (prefix + target) -> plan_seq ----
+        seq_len = int(seq.shape[1])  # = prefix_len + target_len
+        seq_ids_1d = seq[0].detach().cpu()  # 1D ids on CPU for DP caching/hash
+
+        # 用 id hash 做 key，避免你只传 prefix_text 导致 key 不包含 target
+        plan_seq = self._get_or_compute_prefix_plan(seq_ids_1d, prefix_text=None)
+
+        # ---- 2) build total plan: DP for [0:seq_len), fixed for the rest (eos/pad) ----
         plan_total = self._build_total_block_plan(
-            plan_prefix=plan_prefix,
-            prefix_len=prefix_len,
+            plan_prefix=plan_seq,
+            prefix_len=seq_len,  # 注意这里用 seq_len，不是原来的 prefix_len
             total_len=total_len,
         )
         block_sizes_tensor = torch.tensor(plan_total, device=self.device, dtype=torch.long)
@@ -251,6 +273,42 @@ class Fast_dLLM_v2EvalHarness(LM):
         loss = loss.sum()
         loss_acc.append(loss.item())
 
+        # ===== debug: compare multiple fixed-block baselines vs dp =====
+        if self.rank == 0:
+            cand_Bs = [1, 2, 4, 8, 16, 32]
+
+            # DP loss（你当前已算好的）
+            loss_dp = float(loss.item())
+
+            eff_tokens = int((seq_padded[mask_indices] != -100).sum().item())
+
+            # 跑一组 fixed-B baselines
+            fixed_losses = {}
+            for B in cand_Bs:
+                if total_len % B != 0:
+                    # 理论上 total_len 是 32 的倍数时不会发生（除非 self.bd_size 不是 32 的倍数）
+                    continue
+
+                plan_fixed_B = [int(B)] * (total_len // int(B))
+                block_sizes_fixed = torch.tensor(plan_fixed_B, device=self.device, dtype=torch.long)
+
+                logits_fixed = self.get_logits(perturbed_seq, block_sizes=block_sizes_fixed)
+                loss_fixed = F.cross_entropy(
+                    logits_fixed[mask_indices],
+                    seq_padded[mask_indices],
+                    reduction='none'
+                ).sum().item()
+
+                fixed_losses[B] = loss_fixed
+
+            # 打印对比
+            items = " ".join([f"B={B}: {fixed_losses[B]:.6f}" for B in cand_Bs if B in fixed_losses])
+            print(
+                f"[DP DEBUG] eff_tokens={eff_tokens} "
+                f"fixed_losses(sum CE) [{items}] | dp_loss(sum CE)={loss_dp:.6f} "
+                f"prefix_len={prefix_len} total_len={total_len}"
+            )
+            print(f"[DP DEBUG] plan_seq(sum={sum(plan_seq)}, n={len(plan_seq)}): {plan_seq[:32]}")
         return - sum(loss_acc) / len(loss_acc)
 
     def loglikelihood(self, requests):
@@ -574,7 +632,7 @@ class Fast_dLLM_v2EvalHarness(LM):
         """
         key = self._make_prefix_cache_key(prefix_ids, prefix_text=prefix_text)
         cached = self._cache_get_prefix_plan(key)
-        if cached is not None:
+        if cached is not None and not self.debug_prefix_dp_force_recompute:
             return cached
 
         P = int(prefix_ids.numel())
@@ -595,6 +653,47 @@ class Fast_dLLM_v2EvalHarness(LM):
         k = int(ids_for_dp.numel())
         results_avg = self._compute_prefix_cost_table_avg(ids_for_dp, self.dp_block_sizes)
         suffix_plan = self._dp_plan_min_sum_avg(results_avg, k=k, block_sizes=self.dp_block_sizes)
+
+        # ---------- DEBUG: print DP objective (not final target loss) ----------
+        if self.debug_prefix_dp and (self.rank == 0):
+            if (self.debug_prefix_dp_first_n <= 0) or (self._debug_prefix_dp_cnt < self.debug_prefix_dp_first_n):
+                # 1) DP route objective
+                dp_obj = self._dp_obj_sum_avg_from_table(results_avg, suffix_plan, k)
+
+                # 2) Fixed-B objectives for B in {1,2,4,8,16,32}
+                fixed_objs = {}
+                fixed_plans = {}
+                for B in self.dp_block_sizes:
+                    plan_fixed = self._fixed_B_plan_with_leftover(k, int(B), self.dp_block_sizes)
+                    obj_fixed = self._dp_obj_sum_avg_from_table(results_avg, plan_fixed, k)
+                    fixed_objs[int(B)] = obj_fixed
+                    fixed_plans[int(B)] = plan_fixed
+
+                # 3) 打印（你可以按需要精简）
+                P = int(prefix_ids.numel())
+                fixed_len = P - k  # 如果 dp_max_analyze_len 生效，这里>0
+                print("\n" + "=" * 80)
+                print(
+                    f"[PREFIX-DP DEBUG #{self._debug_prefix_dp_cnt}] prefix_total_len={P}, fixed_len={fixed_len}, dp_analyze_len={k}")
+                print(f"  dp_block_sizes={list(map(int, self.dp_block_sizes))}")
+                print(
+                    f"  DP route: obj(sum(avg))={dp_obj:.6f}, n_blocks={len(suffix_plan)}, first_blocks={suffix_plan[:20]}")
+
+                # 固定B：按 B 从小到大打印
+                for B in sorted(fixed_objs.keys()):
+                    obj = fixed_objs[B]
+                    plan_preview = fixed_plans[B][:20]
+                    print(
+                        f"  FIXED B={B:>2}: obj(sum(avg))={obj:.6f}, n_blocks={len(fixed_plans[B])}, first_blocks={plan_preview}")
+
+                bestB = min(fixed_objs, key=lambda x: fixed_objs[x])
+                print(f"  best_fixed_B={bestB}, best_fixed_obj={fixed_objs[bestB]:.6f}")
+                if math.isfinite(dp_obj) and math.isfinite(fixed_objs[bestB]):
+                    print(f"  dp_vs_best_fixed: delta={dp_obj - fixed_objs[bestB]:.6f} (negative means DP better)")
+                print("=" * 80 + "\n")
+
+                self._debug_prefix_dp_cnt += 1
+        # ---------- DEBUG END ----------
 
         plan = fixed_plan + suffix_plan
 
@@ -636,6 +735,56 @@ class Fast_dLLM_v2EvalHarness(LM):
 
         return plan_total
 
+    def _dp_obj_sum_avg_from_table(
+            self,
+            results_avg: Dict[int, List[float]],
+            plan: List[int],
+            k: int,
+    ) -> float:
+        """
+        计算 DP 目标值：sum over blocks of avg_cost(i,B)
+        plan 覆盖长度 k
+        """
+        s = 0.0
+        i = 0
+        for B in plan:
+            B = int(B)
+            c = results_avg[B][i]
+            if not self._is_valid_cost(c):
+                return float("inf")
+            s += float(c)
+            i += B
+        if i != k:
+            return float("inf")
+        return s
+
+    def _fixed_B_plan_with_leftover(
+            self,
+            k: int,
+            B: int,
+            allowed_sizes: Sequence[int],
+    ) -> List[int]:
+        """
+        固定使用 B 尽可能多的块，剩余 rem 用 allowed_sizes(里有1) 贪心凑齐。
+        这样 plan 只包含 allowed_sizes，避免 remainder=3 这种模型可能不支持的 block_size。
+        """
+        B = int(B)
+        if k <= 0:
+            return []
+        plan = [B] * (k // B)
+        rem = k % B
+        if rem == 0:
+            return plan
+
+        sizes = sorted([int(x) for x in allowed_sizes], reverse=True)
+        # 贪心凑 rem（因为包含 1，所以一定能凑出来）
+        while rem > 0:
+            for s in sizes:
+                if s <= rem:
+                    plan.append(s)
+                    rem -= s
+                    break
+        return plan
 
 if __name__ == "__main__":
     cli_evaluate()
