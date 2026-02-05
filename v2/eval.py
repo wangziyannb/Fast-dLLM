@@ -70,7 +70,7 @@ class Fast_dLLM_v2EvalHarness(LM):
             threshold=0.9,
             speed_log_path=None,
             # ===== DP planning for prefix (loglikelihood) =====
-            dp_block_sizes=(1, 4, 8, 16, 32),
+            dp_block_sizes=(4, 8, 16, 32),
             dp_max_analyze_len=None,  # 可选：只对 prefix 末尾 N tokens 做 DP（默认 None=全量）
             dp_cache_size=4096,  # prefix plan LRU cache
             dp_fixed_block_size=None,  # 若 dp_max_analyze_len 截断，前面那段用固定块大小（默认用 self.bd_size）
