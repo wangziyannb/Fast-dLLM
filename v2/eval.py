@@ -20,6 +20,7 @@ This file is inspired by the code from https://github.com/ML-GSAI/SMDM
 '''
 import hashlib
 import math
+from datetime import timedelta
 from typing import OrderedDict, Tuple, List, Optional, Sequence, Dict
 
 import accelerate
@@ -29,6 +30,7 @@ from pathlib import Path
 import random
 import numpy as np
 import torch.nn.functional as F
+from accelerate import InitProcessGroupKwargs
 from datasets import Dataset
 from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.model import LM
@@ -68,7 +70,7 @@ class Fast_dLLM_v2EvalHarness(LM):
             threshold=0.9,
             speed_log_path=None,
             # ===== DP planning for prefix (loglikelihood) =====
-            dp_block_sizes=(1, 2, 4, 8, 16, 32),
+            dp_block_sizes=(1, 4, 8, 16, 32),
             dp_max_analyze_len=None,  # 可选：只对 prefix 末尾 N tokens 做 DP（默认 None=全量）
             dp_cache_size=4096,  # prefix plan LRU cache
             dp_fixed_block_size=None,  # 若 dp_max_analyze_len 截断，前面那段用固定块大小（默认用 self.bd_size）
@@ -79,8 +81,8 @@ class Fast_dLLM_v2EvalHarness(LM):
     ):
 
         super().__init__()
-
-        accelerator = accelerate.Accelerator()
+        pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=120))
+        accelerator = accelerate.Accelerator(kwargs_handlers=[pg_kwargs])
         if accelerator.num_processes > 1:
             self.accelerator = accelerator
         else:
@@ -135,6 +137,24 @@ class Fast_dLLM_v2EvalHarness(LM):
         self.debug_prefix_dp_force_recompute = bool(debug_prefix_dp_force_recompute)
         self._debug_prefix_dp_cnt = 0
 
+        # ---- derived: allowed block sizes & gcd alignment ----
+        self._dp_allowed_sizes = sorted({int(x) for x in self.dp_block_sizes if int(x) > 0}, reverse=True)
+        if not self._dp_allowed_sizes:
+            raise ValueError(f"dp_block_sizes must contain positive ints, got {self.dp_block_sizes}")
+
+        g = 0
+        for x in self._dp_allowed_sizes:
+            g = math.gcd(g, x)
+        self._dp_gcd = int(g)
+        if self._dp_gcd <= 0:
+            raise ValueError(f"Invalid dp_block_sizes={self.dp_block_sizes}")
+
+        # 建议加一个一致性检查：total_len 是 bd_size 的倍数，最好也能被 dp_gcd 整除
+        if int(self.bd_size) % self._dp_gcd != 0:
+            raise ValueError(
+                f"bd_size={self.bd_size} must be divisible by gcd(dp_block_sizes)={self._dp_gcd} "
+                f"to build a valid block plan without illegal tail blocks."
+            )
 
     @property
     def rank(self):
@@ -229,28 +249,56 @@ class Fast_dLLM_v2EvalHarness(LM):
         perturbed_seq = self._forward_process(seq.clone(), prompt_index)  # (1, L1) on device
         total_len = int(perturbed_seq.shape[1])
 
-        # # ---- 1) DP analyze prefix -> plan_prefix ----
-        # plan_prefix = self._get_or_compute_prefix_plan(prefix, prefix_text=prefix_text)
+        # # # ---- 1) DP analyze prefix -> plan_prefix ----
+        # # plan_prefix = self._get_or_compute_prefix_plan(prefix, prefix_text=prefix_text)
+        # #
+        # # # ---- 2) build total plan for full forward (prefix plan + fixed tail) ----
+        # # plan_total = self._build_total_block_plan(
+        # #     plan_prefix=plan_prefix,
+        # #     prefix_len=prefix_len,
+        # #     total_len=total_len,
+        # # )
+        # # block_sizes_tensor = torch.tensor(plan_total, device=self.device, dtype=torch.long)
         #
-        # # ---- 2) build total plan for full forward (prefix plan + fixed tail) ----
+        # # ---- 1) DP analyze full seq (prefix + target) -> plan_seq ----
+        # seq_len = int(seq.shape[1])  # = prefix_len + target_len
+        # seq_ids_1d = seq[0].detach().cpu()  # 1D ids on CPU for DP caching/hash
+        #
+        # # 用 id hash 做 key，避免你只传 prefix_text 导致 key 不包含 target
+        # plan_seq = self._get_or_compute_prefix_plan(seq_ids_1d, prefix_text=None)
+        #
+        # # ---- 2) build total plan: DP for [0:seq_len), fixed for the rest (eos/pad) ----
         # plan_total = self._build_total_block_plan(
-        #     plan_prefix=plan_prefix,
-        #     prefix_len=prefix_len,
+        #     plan_prefix=plan_seq,
+        #     prefix_len=seq_len,  # 注意这里用 seq_len，不是原来的 prefix_len
         #     total_len=total_len,
         # )
         # block_sizes_tensor = torch.tensor(plan_total, device=self.device, dtype=torch.long)
 
-        # ---- 1) DP analyze full seq (prefix + target) -> plan_seq ----
-        seq_len = int(seq.shape[1])  # = prefix_len + target_len
-        seq_ids_1d = seq[0].detach().cpu()  # 1D ids on CPU for DP caching/hash
+        # ---- 1) DP analyze a gcd-aligned prefix length (seq + maybe EOS/pad) ----
+        seq_len = int(seq.shape[1])  # prefix+target length (before _forward_process padding)
+        seq_ids_1d = seq[0].detach().cpu()  # true (unmasked) ids for seq part
 
-        # 用 id hash 做 key，避免你只传 prefix_text 导致 key 不包含 target
-        plan_seq = self._get_or_compute_prefix_plan(seq_ids_1d, prefix_text=None)
+        align = int(self._dp_gcd)  # gcd(dp_block_sizes), e.g. 4
+        dp_len = self._round_up_to(seq_len, align)  # make it representable by {4,8,16,32}
+        if dp_len > total_len:
+            # 理论上不该发生（因为 total_len 是 32 的倍数且 >= seq_len+1）
+            dp_len = total_len
 
-        # ---- 2) build total plan: DP for [0:seq_len), fixed for the rest (eos/pad) ----
+        # ids for DP:
+        #   - [0:seq_len) 用真实 token（不要用 perturbed_seq，那里 prefix_len 位置被 mask 了）
+        #   - [seq_len:dp_len) 用 _forward_process 产生的 EOS + padding masks（不会进 loss）
+        ids_dp = torch.empty((dp_len,), dtype=torch.long)
+        ids_dp[:seq_len] = seq_ids_1d
+        if dp_len > seq_len:
+            ids_dp[seq_len:dp_len] = perturbed_seq[0, seq_len:dp_len].detach().cpu()
+
+        plan_dp = self._get_or_compute_prefix_plan(ids_dp, prefix_text=None)
+
+        # ---- 2) build total plan for whole perturbed sequence ----
         plan_total = self._build_total_block_plan(
-            plan_prefix=plan_seq,
-            prefix_len=seq_len,  # 注意这里用 seq_len，不是原来的 prefix_len
+            plan_prefix=plan_dp,
+            prefix_len=dp_len,
             total_len=total_len,
         )
         block_sizes_tensor = torch.tensor(plan_total, device=self.device, dtype=torch.long)
@@ -275,7 +323,7 @@ class Fast_dLLM_v2EvalHarness(LM):
 
         # ===== debug: compare multiple fixed-block baselines vs dp =====
         if self.rank == 0:
-            cand_Bs = [1, 2, 4, 8, 16, 32]
+            cand_Bs = [4, 8, 16, 32]
 
             # DP loss（你当前已算好的）
             loss_dp = float(loss.item())
@@ -306,9 +354,9 @@ class Fast_dLLM_v2EvalHarness(LM):
             print(
                 f"[DP DEBUG] eff_tokens={eff_tokens} "
                 f"fixed_losses(sum CE) [{items}] | dp_loss(sum CE)={loss_dp:.6f} "
-                f"prefix_len={prefix_len} total_len={total_len}"
+                f"seq_len={seq_len} dp_len={dp_len} total_len={total_len}"
             )
-            print(f"[DP DEBUG] plan_seq(sum={sum(plan_seq)}, n={len(plan_seq)}): {plan_seq[:32]}")
+            print(f"[DP DEBUG] plan_dp(sum={sum(plan_dp)}, n={len(plan_dp)}): {plan_dp[:32]}")
         return - sum(loss_acc) / len(loss_acc)
 
     def loglikelihood(self, requests):
@@ -526,8 +574,21 @@ class Fast_dLLM_v2EvalHarness(LM):
         Returns avg loss over the B tokens.
         """
         # x: (1, i+B)
-        x = prefix_ids_device[: i + B].clone().unsqueeze(0)  # (1, L)
+        # x: (1, i+B)
+        x = prefix_ids_device[: i + B].clone().unsqueeze(0)
         x[:, i:i + B] = self.mask_id
+
+        # pad to multiple of B, and always append at least one block (mimic _forward_process behavior)
+        L0 = int(x.shape[1])
+        pad_len = B - (L0 % B)
+        if pad_len == 0:
+            pad_len = B
+
+        pad = torch.full((1, pad_len), self.mask_id, dtype=torch.long, device=self.device)
+        x = torch.cat([x, pad], dim=1)
+
+        # mark EOS at the first padding position
+        x[:, L0] = self.tokenizer.eos_token_id
 
         out = self.model(
             x,
@@ -636,6 +697,13 @@ class Fast_dLLM_v2EvalHarness(LM):
             return cached
 
         P = int(prefix_ids.numel())
+        # 必须可被 gcd(dp_block_sizes) 整除，否则无法用 allowed sizes 精确覆盖
+        if P % int(self._dp_gcd) != 0:
+            raise ValueError(
+                f"prefix length P={P} is not divisible by gcd(dp_block_sizes)={self._dp_gcd}. "
+                f"Caller should pass a gcd-aligned ids tensor (e.g. extend into EOS/pad)."
+            )
+
         if P == 0:
             self._cache_put_prefix_plan(key, [])
             return []
@@ -645,10 +713,17 @@ class Fast_dLLM_v2EvalHarness(LM):
         ids_for_dp = prefix_ids
         if self.dp_max_analyze_len is not None and P > int(self.dp_max_analyze_len):
             analyze_len = int(self.dp_max_analyze_len)
+            analyze_len = self._round_down_to(analyze_len, int(self._dp_gcd))  # gcd-aligned
             fixed_len = P - analyze_len
+
             fixed_bs = self.dp_fixed_block_size if self.dp_fixed_block_size is not None else int(self.bd_size)
-            fixed_plan = self._fixed_plan_for_len(fixed_len, fixed_bs)
+            fixed_plan = self._plan_for_len_allowed(
+                fixed_len,
+                allowed_sizes=self._dp_allowed_sizes,
+                prefer_size=int(fixed_bs),
+            )
             ids_for_dp = prefix_ids[fixed_len:]  # suffix
+
 
         k = int(ids_for_dp.numel())
         results_avg = self._compute_prefix_cost_table_avg(ids_for_dp, self.dp_block_sizes)
@@ -665,6 +740,7 @@ class Fast_dLLM_v2EvalHarness(LM):
                 fixed_plans = {}
                 for B in self.dp_block_sizes:
                     plan_fixed = self._fixed_B_plan_with_leftover(k, int(B), self.dp_block_sizes)
+                    # plan_fixed = self._fixed_B_plan_with_leftover(k, int(B), [1,4,8,16,32])
                     obj_fixed = self._dp_obj_sum_avg_from_table(results_avg, plan_fixed, k)
                     fixed_objs[int(B)] = obj_fixed
                     fixed_plans[int(B)] = plan_fixed
@@ -699,11 +775,15 @@ class Fast_dLLM_v2EvalHarness(LM):
 
         # Sanity: sum(plan) should equal total prefix length P (unless infeasible)
         if sum(plan) != P:
-            # Fallback: if DP produced incomplete plan, pad remainder with fixed blocks
             missing = P - sum(plan)
             if missing > 0:
                 fixed_bs = self.dp_fixed_block_size if self.dp_fixed_block_size is not None else int(self.bd_size)
-                plan += self._fixed_plan_for_len(missing, fixed_bs)
+                plan += self._plan_for_len_allowed(
+                    missing,
+                    allowed_sizes=self._dp_allowed_sizes,
+                    prefer_size=int(fixed_bs),
+                )
+
 
         self._cache_put_prefix_plan(key, plan)
         return plan
@@ -727,8 +807,13 @@ class Fast_dLLM_v2EvalHarness(LM):
             raise ValueError(f"plan_prefix sum {sum(plan_prefix)} != prefix_len {prefix_len}")
 
         rest_len = total_len - prefix_len
-        plan_rest = self._fixed_plan_for_len(rest_len, int(self.bd_size))
+        plan_rest = self._plan_for_len_allowed(
+            rest_len,
+            allowed_sizes=self._dp_allowed_sizes,
+            prefer_size=int(self.bd_size),
+        )
         plan_total = list(plan_prefix) + plan_rest
+
 
         if sum(plan_total) != total_len:
             raise ValueError(f"plan_total sum {sum(plan_total)} != total_len {total_len}")
@@ -765,25 +850,106 @@ class Fast_dLLM_v2EvalHarness(LM):
             allowed_sizes: Sequence[int],
     ) -> List[int]:
         """
-        固定使用 B 尽可能多的块，剩余 rem 用 allowed_sizes(里有1) 贪心凑齐。
-        这样 plan 只包含 allowed_sizes，避免 remainder=3 这种模型可能不支持的 block_size。
+        固定尽可能多用 B，剩余 rem 用 allowed_sizes 精确填满。
+        不假设 allowed_sizes 里有 1，因此不会死循环。
         """
+        k = int(k)
         B = int(B)
         if k <= 0:
             return []
+        if B <= 0:
+            raise ValueError(f"Invalid B={B}")
+
         plan = [B] * (k // B)
         rem = k % B
-        if rem == 0:
-            return plan
+        if rem:
+            plan += self._plan_for_len_allowed(rem, allowed_sizes=allowed_sizes)
+        if sum(plan) != k:
+            raise RuntimeError(f"fixed-B plan sum {sum(plan)} != k {k}, plan={plan}")
+        return plan
 
-        sizes = sorted([int(x) for x in allowed_sizes], reverse=True)
-        # 贪心凑 rem（因为包含 1，所以一定能凑出来）
-        while rem > 0:
+
+    def _round_up_to(self, x: int, m: int) -> int:
+        x = int(x); m = int(m)
+        if m <= 0:
+            return x
+        return ((x + m - 1) // m) * m
+
+    def _round_down_to(self, x: int, m: int) -> int:
+        x = int(x); m = int(m)
+        if m <= 0:
+            return x
+        return (x // m) * m
+
+    def _plan_for_len_allowed(
+        self,
+        length: int,
+        allowed_sizes: Sequence[int],
+        prefer_size: Optional[int] = None,
+    ) -> List[int]:
+        """
+        返回一个 plan，使得：
+          - 每个 block size 都属于 allowed_sizes
+          - sum(plan) == length
+        用 DP 保证“不会出现尾块 19/3/2/1 这种非法尺寸”。
+        """
+        length = int(length)
+        if length <= 0:
+            return []
+
+        sizes = sorted({int(s) for s in allowed_sizes if int(s) > 0}, reverse=True)
+        if not sizes:
+            raise ValueError("allowed_sizes must contain positive ints")
+
+        # necessary divisibility check
+        g = 0
+        for s in sizes:
+            g = math.gcd(g, s)
+        if length % g != 0:
+            raise ValueError(f"length={length} not divisible by gcd={g} of allowed_sizes={sizes}")
+
+        if prefer_size is not None:
+            ps = int(prefer_size)
+            if ps in sizes:
+                sizes = [ps] + [s for s in sizes if s != ps]
+
+        # DP: minimize number of blocks; tie-break by sizes order (earlier is preferred)
+        rank = {s: i for i, s in enumerate(sizes)}
+        INF = 10**9
+        dp = [INF] * (length + 1)
+        prev: List[Optional[int]] = [None] * (length + 1)
+        dp[0] = 0
+
+        for t in range(0, length + 1):
+            if dp[t] == INF:
+                continue
             for s in sizes:
-                if s <= rem:
-                    plan.append(s)
-                    rem -= s
-                    break
+                nt = t + s
+                if nt > length:
+                    continue
+                cand = dp[t] + 1
+                if cand < dp[nt]:
+                    dp[nt] = cand
+                    prev[nt] = s
+                elif cand == dp[nt]:
+                    if prev[nt] is None or rank[s] < rank[prev[nt]]:
+                        prev[nt] = s
+
+        if dp[length] == INF:
+            raise ValueError(f"Cannot build plan for length={length} with allowed_sizes={sizes}")
+
+        plan: List[int] = []
+        t = length
+        while t > 0:
+            s = prev[t]
+            if s is None:
+                raise RuntimeError("DP reconstruct failed")
+            plan.append(int(s))
+            t -= int(s)
+        plan.reverse()
+
+        if sum(plan) != length:
+            raise RuntimeError(f"plan sum {sum(plan)} != length {length} (plan={plan})")
         return plan
 
 if __name__ == "__main__":
