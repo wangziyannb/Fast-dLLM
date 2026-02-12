@@ -42,7 +42,7 @@ import json
 import time
 import types
 import generation_functions
-from v2.Fast_dLLM_v2_7B.modeling import Fast_dLLM_QwenForCausalLM
+from modeling import Fast_dLLM_QwenForCausalLM
 
 
 def set_seed(seed):
@@ -56,6 +56,7 @@ def set_seed(seed):
 
 @register_model("fast_dllm_v2")
 class Fast_dLLM_v2EvalHarness(LM):
+
     def __init__(
             self,
             model_path='Efficient-Large-Model/Fast_dLLM_v2_7B',
@@ -79,7 +80,6 @@ class Fast_dLLM_v2EvalHarness(LM):
             debug_prefix_dp_force_recompute=False,  # True: 即使cache命中也重新算一次(方便你一直看)
             **kwargs,
     ):
-
         super().__init__()
         pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=120))
         accelerator = accelerate.Accelerator(kwargs_handlers=[pg_kwargs])
@@ -96,6 +96,7 @@ class Fast_dLLM_v2EvalHarness(LM):
             model_path,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
             **model_kwargs
         )
         self.model.eval()
