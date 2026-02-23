@@ -21,7 +21,7 @@ This file is inspired by the code from https://github.com/ML-GSAI/SMDM
 import hashlib
 import math
 from datetime import timedelta
-from typing import OrderedDict, Tuple, List, Optional, Sequence, Dict
+from typing import OrderedDict, Tuple, List, Optional, Sequence, Dict, Any
 
 import accelerate
 import torch
@@ -41,8 +41,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import json
 import time
 import types
-import generation_functions
 from modeling import Fast_dLLM_QwenForCausalLM
+from v2 import generation_functions_new
 
 
 def set_seed(seed):
@@ -101,7 +101,7 @@ class Fast_dLLM_v2EvalHarness(LM):
         )
         self.model.eval()
 
-        self.model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample,
+        self.model.mdm_sample = types.MethodType(generation_functions_new.Fast_dLLM_QwenForCausalLM.batch_sample,
                                                  self.model)
 
         self.device = torch.device(device)
@@ -465,6 +465,8 @@ class Fast_dLLM_v2EvalHarness(LM):
                         seq_len=torch.tensor(seq_len, device=self.device),
                         use_block_cache=self.use_block_cache,
                         threshold=self.threshold,
+                        use_dp_prefill=True,
+                        dp_max_analyze_len=None
                     )
 
             # extract new generated tokens, and keep original index order
@@ -953,5 +955,145 @@ class Fast_dLLM_v2EvalHarness(LM):
             raise RuntimeError(f"plan sum {sum(plan)} != length {length} (plan={plan})")
         return plan
 
+    def _safe_id_to_token(self, tid: int) -> str:
+        # 不同 tokenizer 可能行为不同，做个兜底
+        try:
+            tok = self.tokenizer.convert_ids_to_tokens(tid)
+            if tok is None:
+                tok = self.tokenizer.decode([tid], skip_special_tokens=False)
+            return tok
+        except Exception:
+            return self.tokenizer.decode([tid], skip_special_tokens=False)
+
+    @torch.no_grad()
+    def analyze_tokenwise_bigblock(
+            self,
+            prefix_ids: torch.Tensor,  # 1D (CPU or GPU ok)
+            target_ids: torch.Tensor,  # 1D
+            block_size_big: Optional[int] = None,
+            return_prefix_tokens: bool = False,
+            compute_top1_prob: bool = True,
+            topk_for_print: int = 0,  # >0 则额外给出 topk token（会更慢）
+    ) -> Dict[str, Any]:
+        """
+        用一个“很大的 block_size”做一次 prefill，然后输出逐 token 的：
+          - nll (=-log p_true)
+          - p_true
+          - top1 token / margin（以及可选 top1_prob）
+        默认只返回 target 区间；return_prefix_tokens=True 会把 prefix 区间也返回（pos=1..prefix_len-1）。
+        """
+        # ---- 0) 准备输入 ----
+        prefix_ids = prefix_ids.detach().to("cpu", dtype=torch.long).view(-1)
+        target_ids = target_ids.detach().to("cpu", dtype=torch.long).view(-1)
+
+        seq = torch.cat([prefix_ids, target_ids], dim=0)  # (L,)
+        L = int(seq.numel())
+        prefix_len = int(prefix_ids.numel())
+        assert L > 0
+
+        # ---- 1) 选一个“极大的 block_size”（尽量一块吃完，且 padding 最少）----
+        # 推荐：block_size 取到 >=L 且是 bd_size 的倍数，最多补 31 个 token
+        if block_size_big is None:
+            B = int(self._round_up_to(L, int(self.bd_size)))  # e.g., round up to multiple of 32
+        else:
+            B = int(block_size_big)
+            if B < L:
+                # 保证 block_size >= L（否则无法“一块 prefill”）
+                B = int(self._round_up_to(L, B))
+
+        # ---- 2) padding 到长度 B（padding 内容不会影响前面 logits，因为 causal）----
+        if B > L:
+            pad = torch.full((B - L,), self.mask_id, dtype=torch.long)
+            seq_pad = torch.cat([seq, pad], dim=0)  # (B,)
+        else:
+            seq_pad = seq  # (L==B)
+
+        input_ids = seq_pad.unsqueeze(0).to(self.device)  # (1, B)
+
+        # ---- 3) prefill forward：固定一个很大的 block_size ----
+        # 注意：你这个模型在别处用过 block_size=...，所以这里沿用同一路径
+        out = self.model(input_ids, use_cache=False, block_size=B)
+        logits = out.logits[:, :L, :]  # 只取真实长度部分 (1, L, V)
+
+        # ---- 4) shift 对齐：logits_shift[t] 预测 seq[t] ----
+        logits_shift = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)  # (1, L, V)
+        labels = seq.unsqueeze(0).to(self.device)  # (1, L)
+
+        # ---- 5) 逐 token NLL：用 cross_entropy 一次性算（避免 full softmax）----
+        V = logits_shift.size(-1)
+        # 对 token 1..L-1 计算 nll；pos=0 没有“前文”不计算
+        nll_1_to_end = F.cross_entropy(
+            logits_shift[:, 1:, :].reshape(-1, V),
+            labels[:, 1:].reshape(-1),
+            reduction="none",
+        ).view(1, L - 1)  # (1, L-1)
+
+        # 拼成 (L,) 并给 pos0 填 NaN
+        nll = torch.empty((L,), device="cpu", dtype=torch.float32)
+        nll[0] = float("nan")
+        nll[1:] = nll_1_to_end.squeeze(0).detach().cpu()
+
+        p_true = torch.empty((L,), device="cpu", dtype=torch.float32)
+        p_true[0] = float("nan")
+        p_true[1:] = torch.exp(-nll[1:])  # p_true = exp(-nll)
+
+        # ---- 6) top1 / margin（不需要 softmax）----
+        top2 = torch.topk(logits_shift, k=2, dim=-1)  # values/indices: (1, L, 2)
+        top1_ids = top2.indices[..., 0].squeeze(0).detach().cpu()  # (L,)
+        top1_logits = top2.values[..., 0].squeeze(0).detach().cpu().float()
+        top2_logits = top2.values[..., 1].squeeze(0).detach().cpu().float()
+        margin_logit = top1_logits - top2_logits  # (L,)
+
+        correct_top1 = (top1_ids == seq)  # (L,) bool on CPU
+
+        top1_prob = None
+        if compute_top1_prob:
+            # 需要 logsumexp，但输出只有 (L,) 很小
+            lse = torch.logsumexp(logits_shift, dim=-1).squeeze(0).detach().cpu().float()  # (L,)
+            top1_prob = torch.exp(top1_logits - lse)  # (L,)
+
+        # ---- 7) 组织逐 token 输出 ----
+        start_pos = 0 if return_prefix_tokens else prefix_len
+        rows: List[Dict[str, Any]] = []
+        for t in range(start_pos, L):
+            tid = int(seq[t].item())
+            row = {
+                "pos": t,
+                "is_target": bool(t >= prefix_len),
+                "token_id": tid,
+                "token": self._safe_id_to_token(tid),
+                "nll": float(nll[t].item()),
+                "p_true": float(p_true[t].item()),
+                "top1_id": int(top1_ids[t].item()),
+                "top1_token": self._safe_id_to_token(int(top1_ids[t].item())),
+                "top1_correct": bool(correct_top1[t].item()),
+                "margin_logit": float(margin_logit[t].item()),
+            }
+            if top1_prob is not None:
+                row["top1_prob"] = float(top1_prob[t].item())
+
+            rows.append(row)
+
+        # ---- 8) 汇总：target 的总 loglikelihood / avg nll / ppl ----
+        # target token 位置是 [prefix_len, L-1]，其中 token=prefix_len 对应 nll[prefix_len]
+        target_nll = nll[prefix_len:]  # CPU float32
+        total_target_nll = float(torch.tensor(target_nll).nan_to_num(0.0).sum().item())
+        avg_target_nll = float(torch.tensor(target_nll).nan_to_num(0.0).mean().item()) if (
+                                                                                                      L - prefix_len) > 0 else float(
+            "nan")
+        ppl = float(math.exp(avg_target_nll)) if math.isfinite(avg_target_nll) else float("nan")
+
+        return {
+            "prefix_len": prefix_len,
+            "seq_len": L,
+            "block_size_big": B,
+            "rows": rows,  # 逐 token 结果
+            "summary": {
+                "total_loglikelihood_target": -total_target_nll,
+                "total_nll_target": total_target_nll,
+                "avg_nll_target": avg_target_nll,
+                "ppl_target": ppl,
+            },
+        }
 if __name__ == "__main__":
     cli_evaluate()
