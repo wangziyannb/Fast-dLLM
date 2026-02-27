@@ -381,14 +381,24 @@ class Fast_dLLM_v2EvalHarness(LM):
 
         out = []
         with torch.no_grad():
-            for elem in tqdm(ds, desc="Computing likelihood..."):
+            for idx, elem in enumerate(tqdm(ds, desc="Computing likelihood...")):
                 prefix = elem["prefix"]
                 target = elem["target"]
 
-                # ll = self.get_loglikelihood(prefix, target)
-                ll = self.get_loglikelihood(prefix, target, prefix_text=elem["prefix_text"])
+                analysis = self.analyze_loglikelihood_bigblock(
+                    prefix, target, big_block_size=128, return_prefix=False
+                )
+                ll = analysis["summary"]["total_loglikelihood_target"]
                 out.append((ll, 0.0))
-        torch.cuda.empty_cache()
+
+                if self.rank == 0 and idx < 10:
+                    with open("ll_tokenwise_bigblock.jsonl", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "prefix_text": elem["prefix_text"],
+                            "target_text": elem["target_text"],
+                            "summary": analysis["summary"],
+                            "rows": analysis["rows"],
+                        }, ensure_ascii=False) + "\n")
         return out
 
     def generate_until(self, requests):
